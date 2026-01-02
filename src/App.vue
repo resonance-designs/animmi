@@ -16,6 +16,12 @@ const wavetableFiles = import.meta.glob('./assets/wavetables/**/*.wav', {
   eager: true
 });
 
+const sampleFiles = import.meta.glob('./assets/samples/**/*.wav', {
+  query: '?url',
+  import: 'default',
+  eager: true
+});
+
 const wavetableOptions = computed(() =>
   Object.entries(wavetableFiles).map(([path, url]) => {
     const parts = path.split('/');
@@ -24,11 +30,38 @@ const wavetableOptions = computed(() =>
   })
 );
 
-const selectedTables = reactive([
-  { label: 'Slot A', value: wavetableOptions.value[0]?.value || null, frames: null, lfoRate: 0.15, lfoAmount: 1 },
-  { label: 'Slot B', value: wavetableOptions.value[1]?.value || null, frames: null, lfoRate: 0.15, lfoAmount: 1 },
-  { label: 'Slot C', value: wavetableOptions.value[2]?.value || null, frames: null, lfoRate: 0.15, lfoAmount: 1 },
-  { label: 'Slot D', value: wavetableOptions.value[3]?.value || null, frames: null, lfoRate: 0.15, lfoAmount: 1 }
+const sampleOptions = computed(() =>
+  Object.entries(sampleFiles).map(([path, url]) => {
+    const parts = path.split('/');
+    const label = `${parts.at(-2)}/${parts.at(-1)}`;
+    return { label, value: url };
+  })
+);
+
+const oscillatorTypes = [
+  { title: 'Wavetable', value: 'wavetable' },
+  { title: 'Sample', value: 'sample' }
+];
+
+const createOscillator = (label, wavetableDefault = null, sampleDefault = null) => ({
+  label,
+  type: 'wavetable',
+  wavetable: { value: wavetableDefault, frames: null, lfoRate: 0.15, lfoAmount: 1 },
+  sample: { value: sampleDefault, buffer: null, start: 0, loopStart: 0, loopEnd: 1 },
+  coarse: 0,
+  fine: 0,
+  pitchEnv: { attack: 0.01, decay: 0.08, sustain: 0.4, release: 0.12, amount: 0 },
+  level: 1,
+  pan: 0,
+  muted: false,
+  filter: { type: 'lp24', cutoff: 8000, resonance: 0.2 }
+});
+
+const oscillators = reactive([
+  createOscillator('Slot A', wavetableOptions.value[0]?.value || null, sampleOptions.value[0]?.value || null),
+  createOscillator('Slot B', wavetableOptions.value[1]?.value || null, sampleOptions.value[1]?.value || sampleOptions.value[0]?.value || null),
+  createOscillator('Slot C', wavetableOptions.value[2]?.value || null, sampleOptions.value[2]?.value || sampleOptions.value[0]?.value || null),
+  createOscillator('Slot D', wavetableOptions.value[3]?.value || null, sampleOptions.value[3]?.value || sampleOptions.value[0]?.value || null)
 ]);
 
 const gainSliderHost = ref(null);
@@ -97,7 +130,11 @@ const disposeVoice = (voice) => {
   voice?.slots?.forEach((entry) => {
     entry?.osc?.stop?.();
     entry?.osc?.dispose?.();
+    entry?.player?.stop?.();
+    entry?.player?.dispose?.();
     entry?.gain?.dispose?.();
+    entry?.panner?.dispose?.();
+    entry?.filter?.dispose?.();
     entry?.lfo?.dispose?.();
     entry?.partialLoop?.dispose?.();
   });
@@ -257,34 +294,98 @@ const toNumber = (val, fallback = 0) => {
   return Number.isFinite(num) ? num : fallback;
 };
 
-const ensureSelectedPartials = async () => {
-  const promises = selectedTables.map(async (slot) => {
-    if (slot.value && !slot.frames) {
-      slot.frames = await loadFramesFromWav(slot.value);
+const setOutputGain = (db, ramp = 0.1) => {
+  const nextDb = toNumber(db, gainValue.value);
+  const linear = Tone.dbToGain ? Tone.dbToGain(nextDb) : 10 ** (nextDb / 20);
+  gainValue.value = nextDb;
+  masterGain.gain.rampTo(linear, ramp);
+  Tone.Destination.volume.rampTo(nextDb, ramp);
+};
+
+const clamp01 = (val) => Math.min(Math.max(toNumber(val, 0), 0), 1);
+
+const semitoneOffset = (slot) => toNumber(slot.coarse, 0) + toNumber(slot.fine, 0) / 100;
+
+const ensureSlotAssets = async () => {
+  const promises = oscillators.map(async (slot) => {
+    if (slot.type === 'wavetable' && slot.wavetable.value && !slot.wavetable.frames) {
+      slot.wavetable.frames = await loadFramesFromWav(slot.wavetable.value);
+    }
+    if (slot.type === 'sample' && slot.sample.value && !slot.sample.buffer) {
+      slot.sample.buffer = await loadBuffer(slot.sample.value);
     }
   });
   await Promise.all(promises);
 };
 
-const updateSlotPartials = async (slotIndex) => {
-  const slot = selectedTables[slotIndex];
-  slot.frames = null;
-  await ensureSelectedPartials();
-  buildVoicePool();
+const updateWavetableSlot = async (slotIndex) => {
+  const slot = oscillators[slotIndex];
+  slot.wavetable.frames = null;
+  await buildVoicePool();
+};
+
+const updateSampleSlot = async (slotIndex) => {
+  const slot = oscillators[slotIndex];
+  slot.sample.buffer = null;
+  await buildVoicePool();
 };
 
 const updateSlotModulation = (slotIndex) => {
-  const slot = selectedTables[slotIndex];
-  slot.lfoRate = toNumber(slot.lfoRate, 0);
-  slot.lfoAmount = toNumber(slot.lfoAmount, 0);
+  const slot = oscillators[slotIndex];
+  if (slot.type !== 'wavetable') return;
+  slot.wavetable.lfoRate = toNumber(slot.wavetable.lfoRate, 0);
+  slot.wavetable.lfoAmount = toNumber(slot.wavetable.lfoAmount, 0);
   voicePool.forEach((voice) => {
     const entry = voice.slots?.[slotIndex];
-    if (!entry) return;
-    const frameCount = Math.max(slot.frames?.length || 0, 1);
-    entry.lfo.frequency.value = slot.lfoRate;
+    if (!entry || entry.type !== 'wavetable') return;
+    const frameCount = Math.max(slot.wavetable.frames?.length || 0, 1);
+    entry.lfo.frequency.value = slot.wavetable.lfoRate;
     entry.lfo.min = 0;
-    entry.lfo.max = frameCount > 1 ? (frameCount - 1) * slot.lfoAmount : 0;
+    entry.lfo.max = frameCount > 1 ? (frameCount - 1) * slot.wavetable.lfoAmount : 0;
   });
+};
+
+const updateSlotPanner = (slotIndex) => {
+  const slot = oscillators[slotIndex];
+  voicePool.forEach((voice) => {
+    const entry = voice.slots?.[slotIndex];
+    if (!entry?.panner) return;
+    entry.panner.pan.rampTo(toNumber(slot.pan, 0), 0.05);
+  });
+};
+
+const slotFilterConfig = (slot) => {
+  switch (slot.filter.type) {
+    case 'hp':
+      return { type: 'highpass', rolloff: -12 };
+    case 'bp':
+      return { type: 'bandpass', rolloff: -12 };
+    case 'lp12':
+      return { type: 'lowpass', rolloff: -12 };
+    default:
+      return { type: 'lowpass', rolloff: -24 };
+  }
+};
+
+const updateSlotFilter = (slotIndex) => {
+  const slot = oscillators[slotIndex];
+  const cfg = slotFilterConfig(slot);
+  voicePool.forEach((voice) => {
+    const entry = voice.slots?.[slotIndex];
+    if (!entry?.filter) return;
+    entry.filter.type = cfg.type;
+    entry.filter.rolloff = cfg.rolloff;
+    entry.filter.frequency.value = toNumber(slot.filter.cutoff, 8000);
+    entry.filter.Q.value = toNumber(slot.filter.resonance, 0.2) * 18;
+  });
+};
+
+const updateSlotLevels = () => updateActiveVoiceGains();
+
+const normalizeSampleWindow = (slot) => {
+  slot.sample.start = clamp01(slot.sample.start);
+  slot.sample.loopStart = Math.max(slot.sample.start, clamp01(slot.sample.loopStart));
+  slot.sample.loopEnd = Math.max(slot.sample.loopStart, clamp01(slot.sample.loopEnd));
 };
 
 const getVectorWeights = () => {
@@ -310,9 +411,14 @@ const disposePool = () => {
   voicePool = [];
 };
 
-const buildVoicePool = () => {
+const buildVoicePool = async () => {
   disposePool();
-  const hasAny = selectedTables.some((slot) => slot.frames?.length);
+  await ensureSlotAssets();
+  const hasAny = oscillators.some((slot) => {
+    if (slot.type === 'wavetable') return slot.wavetable.frames?.length;
+    if (slot.type === 'sample') return slot.sample.buffer;
+    return false;
+  });
   if (!hasAny) return;
 
   for (let i = 0; i < POLY_VOICES; i += 1) {
@@ -345,20 +451,41 @@ const buildVoicePool = () => {
     mix.connect(filterNode);
     filterNode.connect(envelope);
     envelope.connect(masterGain);
-    const slots = selectedTables.map((slot) => {
-      if (!slot.frames?.length) return null;
+    const slots = oscillators.map((slot) => {
+      const cfg = slotFilterConfig(slot);
       const gain = new Tone.Gain(0).connect(mix);
-      const frames = slot.frames;
+      const panner = new Tone.Panner(toNumber(slot.pan, 0)).connect(gain);
+      const filter = new Tone.Filter({
+        type: cfg.type,
+        rolloff: cfg.rolloff,
+        frequency: toNumber(slot.filter.cutoff, 8000),
+        Q: toNumber(slot.filter.resonance, 0.2) * 18
+      }).connect(panner);
+
+      if (slot.type === 'sample') {
+        if (!slot.sample.buffer) return null;
+        const player = new Tone.Player({
+          url: slot.sample.buffer,
+          loop: true,
+          autostart: false
+        }).connect(filter);
+        player.fadeIn = 0.005;
+        player.fadeOut = Math.max(0.01, toNumber(slot.pitchEnv.release, 0.12));
+        return { type: 'sample', slot, player, gain, panner, filter, playing: false };
+      }
+
+      if (!slot.wavetable.frames?.length) return null;
+      const frames = slot.wavetable.frames;
       const frameCount = Math.max(frames.length, 1);
       const lfo = new Tone.LFO({
-        frequency: toNumber(slot.lfoRate, 0.15),
+        frequency: toNumber(slot.wavetable.lfoRate, 0.15),
         min: 0,
-        max: frameCount > 1 ? (frameCount - 1) * toNumber(slot.lfoAmount, 1) : 0
+        max: frameCount > 1 ? (frameCount - 1) * toNumber(slot.wavetable.lfoAmount, 1) : 0
       }).start();
       const osc = new Tone.Oscillator({
         type: 'custom',
         partials: frames[0] || [1]
-      }).connect(gain);
+      }).connect(filter);
       const partialLoop = frameCount > 1
         ? new Tone.Loop(() => {
             const pos = lfo.value;
@@ -369,7 +496,7 @@ const buildVoicePool = () => {
           }, '32n').start(0)
         : null;
       osc.start();
-      return { osc, gain, lfo, partialLoop };
+      return { type: 'wavetable', slot, osc, gain, lfo, partialLoop, panner, filter };
     });
 
     voicePool.push({
@@ -381,6 +508,8 @@ const buildVoicePool = () => {
       note: null
     });
   }
+
+  updateActiveVoiceGains();
 };
 
 const updateActiveVoiceGains = () => {
@@ -389,24 +518,82 @@ const updateActiveVoiceGains = () => {
   voicePool.forEach((voice) => {
     if (!voice.busy) return;
     voice.slots?.forEach((entry, idx) => {
-      if (entry?.gain) {
-        const w = toNumber(weights[idx], 0);
-        if (Number.isFinite(w)) {
-          entry.gain.gain.setTargetAtTime(w, now, 0.03);
-        }
+      if (!entry?.gain) return;
+      const slot = oscillators[idx];
+      const w = toNumber(weights[idx], 0);
+      const level = slot ? Math.max(0, toNumber(slot.level, 1)) : 1;
+      const muted = slot?.muted;
+      const target = muted ? 0 : w * level;
+      if (Number.isFinite(target)) {
+        entry.gain.gain.setTargetAtTime(target, now, 0.03);
       }
     });
   });
 };
 
+const semitoneToRatio = (semi) => 2 ** (semi / 12);
+
+const setParamValue = (param, value, time) => {
+  if (param?.setValueAtTime) {
+    param.setValueAtTime(value, time);
+    return true;
+  }
+  if (param?.value !== undefined) {
+    param.value = value;
+    return true;
+  }
+  return false;
+};
+
+const schedulePitchEnvelope = (target, baseVal, env, time) => {
+  if (!target) return;
+  const attack = Math.max(toNumber(env.attack, 0), 0);
+  const decay = Math.max(toNumber(env.decay, 0), 0);
+  const sustain = clamp01(env.sustain ?? 0);
+  const amount = toNumber(env.amount, 0);
+  const peak = baseVal * semitoneToRatio(amount);
+  const sustainVal = baseVal * semitoneToRatio(amount * sustain);
+  const attackEnd = time + attack;
+  const decayEnd = attackEnd + decay;
+  if (target.cancelAndHoldAtTime) {
+    target.cancelAndHoldAtTime(time);
+  }
+  if (!setParamValue(target, baseVal, time)) return;
+  if (target.linearRampToValueAtTime) {
+    target.linearRampToValueAtTime(peak, attackEnd);
+    target.linearRampToValueAtTime(sustainVal, decayEnd);
+  } else if (target.rampTo) {
+    target.rampTo(peak, Math.max(attack, 0.001));
+    target.rampTo(sustainVal, Math.max(decay, 0.001));
+  }
+};
+
+const slotFrequencyForNote = (slot, note) =>
+  Tone.Frequency(note).transpose(semitoneOffset(slot)).toFrequency();
+
+const playbackRateForNote = (slot, note, baseMidi = 60) => {
+  const midi = Tone.Frequency(note).toMidi();
+  const offset = midi - baseMidi + semitoneOffset(slot);
+  return semitoneToRatio(offset);
+};
+
+const sampleLoopPoints = (slot, buffer) => {
+  const duration = buffer?.duration ?? 0;
+  const start = clamp01(slot.sample.start);
+  const loopStartPct = Math.max(start, clamp01(slot.sample.loopStart));
+  const loopEndPct = Math.max(loopStartPct, clamp01(slot.sample.loopEnd) || 1);
+  const startTime = start * duration;
+  const loopStart = loopStartPct * duration;
+  const loopEnd = Math.max(loopStart + 0.001, loopEndPct * duration);
+  return { startTime, loopStart, loopEnd };
+};
+
 const triggerNoteOn = async (note, velocity = 0.9, time = Tone.now()) => {
   await ensureAudio();
-  await ensureSelectedPartials();
-  if (!voicePool.length) buildVoicePool();
+  if (!voicePool.length) await buildVoicePool();
   if (!voicePool.length) return null;
 
   const weights = getVectorWeights();
-  const freq = Tone.Frequency(note).toFrequency();
   const now = time ?? Tone.now();
 
   const voice = voicePool.find((v) => !v.busy) || voicePool[0];
@@ -459,11 +646,37 @@ const triggerNoteOn = async (note, velocity = 0.9, time = Tone.now()) => {
 
   voice.slots?.forEach((entry, idx) => {
     if (!entry) return;
+    const slot = oscillators[idx];
     const w = toNumber(weights[idx], 0);
-    if (Number.isFinite(w)) {
-      entry.gain.gain.setTargetAtTime(w, now, 0.03);
+    const level = Math.max(0, toNumber(slot?.level ?? 1, 1));
+    const muted = slot?.muted;
+    const target = muted ? 0 : w * level;
+    if (Number.isFinite(target)) {
+      entry.gain.gain.setTargetAtTime(target, now, 0.03);
     }
-    entry.osc.frequency.setValueAtTime(freq, now);
+
+    if (entry.type === 'wavetable' && entry.osc) {
+      const freq = slotFrequencyForNote(slot, note);
+      setParamValue(entry.osc.frequency, freq, now);
+      schedulePitchEnvelope(entry.osc.frequency, freq, slot.pitchEnv, now);
+    }
+
+    if (entry.type === 'sample' && entry.player) {
+      const rate = playbackRateForNote(slot, note);
+      const rateParam = entry.player.playbackRate;
+      if (rateParam?.setValueAtTime || rateParam?.value !== undefined) {
+        setParamValue(rateParam, rate, now);
+        schedulePitchEnvelope(rateParam, rate, slot.pitchEnv, now);
+      } else {
+        entry.player.playbackRate = rate;
+      }
+      const pts = sampleLoopPoints(slot, entry.player.buffer);
+      entry.player.loopStart = pts.loopStart;
+      entry.player.loopEnd = pts.loopEnd;
+      entry.player.stop(now);
+      entry.player.start(now, pts.startTime);
+      entry.playing = true;
+    }
   });
 
   voice.envelope.triggerAttack(now, velocity);
@@ -483,6 +696,15 @@ const triggerNoteOff = (note, time = Tone.now(), voiceRef = null) => {
     voice = idx >= 0 ? voices.splice(idx, 1)[0] : voices.shift();
   } else {
     voice = voices.shift();
+  }
+  if (voice?.slots) {
+    voice.slots.forEach((entry) => {
+      if (entry?.type === 'sample' && entry.player) {
+        const rel = Math.max(toNumber(entry.slot?.pitchEnv?.release, 0.12), 0);
+        entry.player.stop(time + rel + 0.02);
+        entry.playing = false;
+      }
+    });
   }
   if (voice?.envelope) {
     voice.envelope.triggerRelease(time);
@@ -531,8 +753,7 @@ const syncSequencerPage = () => {
 
 const startSequencer = async () => {
   await ensureAudio();
-  await ensureSelectedPartials();
-  if (!voicePool.length) buildVoicePool();
+  if (!voicePool.length) await buildVoicePool();
   Tone.Transport.bpm.value = bpm.value;
   if (!loop) {
     loop = new Tone.Loop(handleSequencerStep, '16n');
@@ -606,8 +827,7 @@ onMounted(() => {
     });
 
     slider.on('change', ({ value }) => {
-      gainValue.value = value;
-      Tone.Destination.volume.rampTo(value, 0.1);
+      setOutputGain(value, 0.1);
     });
   }
 
@@ -644,6 +864,7 @@ onMounted(() => {
   }
 
   startVectorLfos();
+  setOutputGain(gainValue.value, 0);
 });
 
 onBeforeUnmount(() => {
@@ -691,9 +912,9 @@ watch(
             <v-card>
               <v-card-title class="d-flex align-center justify-space-between">
                 <div>
-                  <div class="text-h6">Vector Wavetable Synth</div>
+                  <div class="text-h6">Vector Synth</div>
                   <div class="text-subtitle-2 text-medium-emphasis">
-                    Four-slot vector oscillator blended by the joystick.
+                    Four-slot vector blend with wavetable or sample oscillators.
                   </div>
                 </div>
                 <div class="d-flex align-center ga-4">
@@ -706,80 +927,94 @@ watch(
               </v-card-title>
 
               <v-card-text>
-                <v-row class="mb-4">
-                  <v-col cols="12" md="6">
-                    <div class="text-subtitle-1 font-weight-medium mb-2">Wavetables</div>
-                    <v-row dense>
-                      <v-col v-for="(slot, idx) in selectedTables" :key="slot.label" cols="12" sm="6">
+                <div class="text-subtitle-1 font-weight-medium mb-2">Oscillators</div>
+                <v-row dense class="mb-4">
+                  <v-col v-for="(slot, idx) in oscillators" :key="slot.label" cols="12" md="6">
+                    <v-sheet class="pa-3 h-100" border rounded>
+                      <div class="d-flex align-center justify-space-between mb-2">
+                        <div class="text-subtitle-2">{{ slot.label }}</div>
+                        <v-switch
+                          density="compact"
+                          inset
+                          color="red-darken-1"
+                          hide-details
+                          label="Mute"
+                          v-model="slot.muted"
+                          @update:model-value="updateSlotLevels"
+                        />
+                      </div>
+
+                      <v-select
+                        label="Type"
+                        :items="oscillatorTypes"
+                        v-model="slot.type"
+                        variant="outlined"
+                        density="comfortable"
+                        hide-details
+                        @update:model-value="() => buildVoicePool()"
+                      />
+
+                      <template v-if="slot.type === 'wavetable'">
                         <v-select
-                          :label="slot.label"
+                          class="mt-2"
+                          label="Wavetable"
                           :items="wavetableOptions"
                           item-title="label"
                           item-value="value"
-                          v-model="slot.value"
+                          v-model="slot.wavetable.value"
                           density="comfortable"
                           variant="outlined"
                           hide-details
-                          @update:model-value="() => updateSlotPartials(idx)"
+                          @update:model-value="() => updateWavetableSlot(idx)"
                         />
-                        <v-text-field
-                          class="mt-2"
-                          label="LFO rate (Hz)"
-                          type="number"
-                          variant="outlined"
-                          density="comfortable"
-                          hide-details
-                          :min="0"
-                          :step="0.01"
-                          v-model.number="slot.lfoRate"
-                          @update:model-value="() => updateSlotModulation(idx)"
-                        />
-                        <v-slider
-                          class="mt-2"
-                          label="LFO amount"
-                          v-model.number="slot.lfoAmount"
-                          min="0"
-                          max="1"
-                          step="0.01"
-                          density="comfortable"
-                          hide-details
-                          thumb-label
-                          color="primary"
-                          @update:model-value="() => updateSlotModulation(idx)"
-                        />
-                      </v-col>
-                    </v-row>
-                  </v-col>
+                        <v-row dense class="mt-2">
+                          <v-col cols="6">
+                            <v-text-field
+                              label="LFO rate (Hz)"
+                              type="number"
+                              variant="outlined"
+                              density="comfortable"
+                              hide-details
+                              :min="0"
+                              :step="0.01"
+                              v-model.number="slot.wavetable.lfoRate"
+                              @update:model-value="() => updateSlotModulation(idx)"
+                            />
+                          </v-col>
+                          <v-col cols="6">
+                            <v-slider
+                              label="LFO amount"
+                              v-model.number="slot.wavetable.lfoAmount"
+                              min="0"
+                              max="1"
+                              step="0.01"
+                              density="comfortable"
+                              hide-details
+                              thumb-label
+                              color="primary"
+                              @update:model-value="() => updateSlotModulation(idx)"
+                            />
+                          </v-col>
+                        </v-row>
+                      </template>
 
-                  <v-col cols="12" md="6">
-                    <div class="text-subtitle-1 font-weight-medium mb-2">
-                      Vector Joystick (Nexus Position)
-                    </div>
-                    <div class="nexus-pad" ref="xyHost" />
-                    <div class="text-body-2 text-medium-emphasis mt-2">
-                      X/Y mix → A/B/C/D: {{ vectorPos.x.toFixed(2) }} / {{ vectorPos.y.toFixed(2) }}
-                    </div>
-                    <v-divider class="my-2" />
-                    <div class="text-subtitle-2 font-weight-medium mb-1">
-                      Vector LFOs
-                    </div>
-                    <v-row dense>
-                      <v-col cols="6">
-                        <v-text-field
-                          label="X rate (Hz)"
-                          type="number"
-                          v-model.number="vectorLfo.xRate"
-                          variant="outlined"
+                      <template v-else>
+                        <v-select
+                          class="mt-2"
+                          label="Sample"
+                          :items="sampleOptions"
+                          item-title="label"
+                          item-value="value"
+                          v-model="slot.sample.value"
                           density="comfortable"
+                          variant="outlined"
                           hide-details
-                          :step="0.01"
-                          :min="0"
+                          @update:model-value="() => updateSampleSlot(idx)"
                         />
-                      </v-col>
-                      <v-col cols="6">
                         <v-slider
-                          label="X amount"
-                          v-model.number="vectorLfo.xAmount"
+                          class="mt-2"
+                          label="Sample start"
+                          v-model.number="slot.sample.start"
                           min="0"
                           max="1"
                           step="0.01"
@@ -787,24 +1022,12 @@ watch(
                           hide-details
                           thumb-label
                           color="primary"
+                          @update:model-value="() => normalizeSampleWindow(slot)"
                         />
-                      </v-col>
-                      <v-col cols="6">
-                        <v-text-field
-                          label="Y rate (Hz)"
-                          type="number"
-                          v-model.number="vectorLfo.yRate"
-                          variant="outlined"
-                          density="comfortable"
-                          hide-details
-                          :step="0.01"
-                          :min="0"
-                        />
-                      </v-col>
-                      <v-col cols="6">
                         <v-slider
-                          label="Y amount"
-                          v-model.number="vectorLfo.yAmount"
+                          class="mt-2"
+                          label="Loop start"
+                          v-model.number="slot.sample.loopStart"
                           min="0"
                           max="1"
                           step="0.01"
@@ -812,9 +1035,244 @@ watch(
                           hide-details
                           thumb-label
                           color="primary"
+                          @update:model-value="() => normalizeSampleWindow(slot)"
                         />
-                      </v-col>
-                    </v-row>
+                        <v-slider
+                          class="mt-2"
+                          label="Loop end"
+                          v-model.number="slot.sample.loopEnd"
+                          min="0"
+                          max="1"
+                          step="0.01"
+                          density="comfortable"
+                          hide-details
+                          thumb-label
+                          color="primary"
+                          @update:model-value="() => normalizeSampleWindow(slot)"
+                        />
+                      </template>
+
+                      <v-row dense class="mt-2">
+                        <v-col cols="6">
+                          <v-text-field
+                            label="Coarse (st)"
+                            type="number"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            v-model.number="slot.coarse"
+                          />
+                        </v-col>
+                        <v-col cols="6">
+                          <v-text-field
+                            label="Fine (cents)"
+                            type="number"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            :step="1"
+                            v-model.number="slot.fine"
+                          />
+                        </v-col>
+                        <v-col cols="6">
+                          <v-text-field
+                            label="Pitch amt (st)"
+                            type="number"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            v-model.number="slot.pitchEnv.amount"
+                          />
+                        </v-col>
+                        <v-col cols="6">
+                          <v-text-field
+                            label="Pitch attack (s)"
+                            type="number"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            :step="0.01"
+                            v-model.number="slot.pitchEnv.attack"
+                          />
+                        </v-col>
+                        <v-col cols="6">
+                          <v-text-field
+                            label="Pitch decay (s)"
+                            type="number"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            :step="0.01"
+                            v-model.number="slot.pitchEnv.decay"
+                          />
+                        </v-col>
+                        <v-col cols="6">
+                          <v-text-field
+                            label="Pitch release (s)"
+                            type="number"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            :step="0.01"
+                            v-model.number="slot.pitchEnv.release"
+                          />
+                        </v-col>
+                        <v-col cols="12">
+                          <v-slider
+                            label="Pitch sustain"
+                            v-model.number="slot.pitchEnv.sustain"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            density="comfortable"
+                            hide-details
+                            thumb-label
+                            color="primary"
+                          />
+                        </v-col>
+                      </v-row>
+
+                      <v-row dense class="mt-1">
+                        <v-col cols="6">
+                          <v-slider
+                            label="Level"
+                            v-model.number="slot.level"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            density="comfortable"
+                            hide-details
+                            thumb-label
+                            color="primary"
+                            @update:model-value="updateSlotLevels"
+                          />
+                        </v-col>
+                        <v-col cols="6">
+                          <v-slider
+                            label="Pan"
+                            v-model.number="slot.pan"
+                            min="-1"
+                            max="1"
+                            step="0.01"
+                            density="comfortable"
+                            hide-details
+                            thumb-label
+                            color="primary"
+                            @update:model-value="() => updateSlotPanner(idx)"
+                          />
+                        </v-col>
+                      </v-row>
+
+                      <v-row dense class="mt-1">
+                        <v-col cols="6">
+                          <v-select
+                            label="Filter"
+                            :items="[
+                              { title: 'LP24', value: 'lp24' },
+                              { title: 'LP12', value: 'lp12' },
+                              { title: 'HP', value: 'hp' },
+                              { title: 'BP', value: 'bp' }
+                            ]"
+                            v-model="slot.filter.type"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            @update:model-value="() => updateSlotFilter(idx)"
+                          />
+                        </v-col>
+                        <v-col cols="6">
+                          <v-text-field
+                            label="Cutoff (Hz)"
+                            type="number"
+                            variant="outlined"
+                            density="comfortable"
+                            hide-details
+                            v-model.number="slot.filter.cutoff"
+                            @update:model-value="() => updateSlotFilter(idx)"
+                          />
+                        </v-col>
+                        <v-col cols="12">
+                          <v-slider
+                            label="Resonance"
+                            v-model.number="slot.filter.resonance"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            density="comfortable"
+                            hide-details
+                            thumb-label
+                            color="primary"
+                            @update:model-value="() => updateSlotFilter(idx)"
+                          />
+                        </v-col>
+                      </v-row>
+                    </v-sheet>
+                  </v-col>
+                </v-row>
+
+                <v-divider class="my-4" />
+
+                <div class="text-subtitle-1 font-weight-medium mb-2">
+                  Vector Joystick (Nexus Position)
+                </div>
+                <div class="nexus-pad" ref="xyHost" />
+                <div class="text-body-2 text-medium-emphasis mt-2">
+                  X/Y mix → A/B/C/D: {{ vectorPos.x.toFixed(2) }} / {{ vectorPos.y.toFixed(2) }}
+                </div>
+                <v-divider class="my-2" />
+                <div class="text-subtitle-2 font-weight-medium mb-1">
+                  Vector LFOs
+                </div>
+                <v-row dense>
+                  <v-col cols="6">
+                    <v-text-field
+                      label="X rate (Hz)"
+                      type="number"
+                      v-model.number="vectorLfo.xRate"
+                      variant="outlined"
+                      density="comfortable"
+                      hide-details
+                      :step="0.01"
+                      :min="0"
+                    />
+                  </v-col>
+                  <v-col cols="6">
+                    <v-slider
+                      label="X amount"
+                      v-model.number="vectorLfo.xAmount"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      density="comfortable"
+                      hide-details
+                      thumb-label
+                      color="primary"
+                    />
+                  </v-col>
+                  <v-col cols="6">
+                    <v-text-field
+                      label="Y rate (Hz)"
+                      type="number"
+                      v-model.number="vectorLfo.yRate"
+                      variant="outlined"
+                      density="comfortable"
+                      hide-details
+                      :step="0.01"
+                      :min="0"
+                    />
+                  </v-col>
+                  <v-col cols="6">
+                    <v-slider
+                      label="Y amount"
+                      v-model.number="vectorLfo.yAmount"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      density="comfortable"
+                      hide-details
+                      thumb-label
+                      color="primary"
+                    />
                   </v-col>
                 </v-row>
 
