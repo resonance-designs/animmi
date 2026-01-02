@@ -43,10 +43,27 @@ const oscillatorTypes = [
   { title: 'Sample', value: 'sample' }
 ];
 
+const lfoShapeOptions = [
+  { title: 'Sine', value: 'sine' },
+  { title: 'Triangle', value: 'triangle' },
+  { title: 'Square', value: 'square' },
+  { title: 'Sawtooth', value: 'sawtooth' },
+  { title: 'Sample & Hold', value: 'random' }
+];
+
 const createOscillator = (label, wavetableDefault = null, sampleDefault = null) => ({
   label,
   type: 'wavetable',
-  wavetable: { value: wavetableDefault, frames: null, lfoRate: 0.15, lfoAmount: 1 },
+  wavetable: {
+    value: wavetableDefault,
+    frames: null,
+    lfoRate: 0.15,
+    lfoAmount: 1,
+    lfoShape: 'sine',
+    lfoSync: false,
+    lfoSteps: 4,
+    lfoEnabled: true
+  },
   sample: { value: sampleDefault, buffer: null, start: 0, loopStart: 0, loopEnd: 1 },
   coarse: 0,
   fine: 0,
@@ -73,7 +90,20 @@ const gainValue = ref(-6);
 const isAudioReady = ref(false);
 const vectorBase = reactive({ x: 0.5, y: 0.5 });
 const vectorPos = reactive({ x: 0.5, y: 0.5 });
-const vectorLfo = reactive({ xRate: 0.1, xAmount: 0, yRate: 0.13, yAmount: 0 });
+const vectorLfo = reactive({
+  xRate: 0.1,
+  xAmount: 0,
+  xShape: 'sine',
+  xSync: false,
+  xSteps: 4,
+  xEnabled: true,
+  yRate: 0.13,
+  yAmount: 0,
+  yShape: 'sine',
+  ySync: false,
+  ySteps: 4,
+  yEnabled: true
+});
 const filterType = ref('moog');
 const moogParams = reactive({ cutoff: 1200, resonance: 0.5, drive: 0.5 });
 const combParams = reactive({ delayTime: 0.02, resonance: 0.6, dampening: 3000 });
@@ -146,6 +176,11 @@ const disposeVoice = (voice) => {
 const ensureAudio = async () => {
   if (!isAudioReady.value) {
     await Tone.start();
+    const ctx = Tone.getContext();
+    if (ctx) {
+      ctx.lookAhead = 0.08;
+      ctx.updateInterval = 0.02;
+    }
     isAudioReady.value = true;
     startVectorLfos();
   }
@@ -240,19 +275,56 @@ const rotatePartials = (partials, shift = 1) => {
   return out;
 };
 
+const TWO_PI = 2 * Math.PI;
+const getStepDurationSeconds = () => (60 / Math.max(1, toNumber(bpm.value, 120))) / 4;
+
+const computeLfoFrequency = (rateHz = 0, sync = false, steps = 4) => {
+  if (sync) {
+    const stepCount = Math.max(1, toNumber(steps, 1));
+    const duration = getStepDurationSeconds() * stepCount;
+    return 1 / Math.max(duration, 0.0001);
+  }
+  return Math.max(0, toNumber(rateHz, 0));
+};
+
+const vectorShapeValue = (shape, phase, axis) => {
+  const norm = ((phase % TWO_PI) + TWO_PI) % TWO_PI;
+  const pct = norm / TWO_PI;
+  switch (shape) {
+    case 'triangle':
+      return 1 - 4 * Math.abs(pct - 0.5);
+    case 'square':
+      return Math.sign(Math.sin(norm)) || 1;
+    case 'sawtooth':
+      return 2 * pct - 1;
+    case 'random':
+      if (phase - vectorLfoHoldPhase[axis] >= TWO_PI) {
+        vectorLfoHoldPhase[axis] = phase;
+        vectorLfoHold[axis] = Math.random() * 2 - 1;
+      }
+      return vectorLfoHold[axis];
+    default:
+      return Math.sin(norm);
+  }
+};
+
 const startVectorLfos = () => {
   const driveUi = (ts) => {
     const now = ts || performance.now();
     const dt = vectorLfoLast ? (now - vectorLfoLast) / 1000 : 0;
     vectorLfoLast = now;
-    const rateX = toNumber(vectorLfo.xRate, 0);
-    const rateY = toNumber(vectorLfo.yRate, 0);
-    const amtX = toNumber(vectorLfo.xAmount, 0);
-    const amtY = toNumber(vectorLfo.yAmount, 0);
-    vectorLfoPhase.x += 2 * Math.PI * rateX * dt;
-    vectorLfoPhase.y += 2 * Math.PI * rateY * dt;
-    const lfoXVal = amtX * Math.sin(vectorLfoPhase.x);
-    const lfoYVal = amtY * Math.sin(vectorLfoPhase.y);
+    if (!vectorLfoTransportRunning) {
+      vectorLfoFrame = requestAnimationFrame(driveUi);
+      return;
+    }
+    const rateX = vectorLfo.xEnabled ? computeLfoFrequency(vectorLfo.xRate, vectorLfo.xSync, vectorLfo.xSteps) : 0;
+    const rateY = vectorLfo.yEnabled ? computeLfoFrequency(vectorLfo.yRate, vectorLfo.ySync, vectorLfo.ySteps) : 0;
+    const amtX = vectorLfo.xEnabled ? toNumber(vectorLfo.xAmount, 0) : 0;
+    const amtY = vectorLfo.yEnabled ? toNumber(vectorLfo.yAmount, 0) : 0;
+    vectorLfoPhase.x += TWO_PI * rateX * dt;
+    vectorLfoPhase.y += TWO_PI * rateY * dt;
+    const lfoXVal = amtX * vectorShapeValue(vectorLfo.xShape, vectorLfoPhase.x, 'x');
+    const lfoYVal = amtY * vectorShapeValue(vectorLfo.yShape, vectorLfoPhase.y, 'y');
     const baseX = toNumber(vectorBase.x, 0.5);
     const baseY = toNumber(vectorBase.y, 0.5);
     const x = Math.min(Math.max(baseX + lfoXVal, 0), 1);
@@ -275,7 +347,12 @@ const startVectorLfos = () => {
 };
 
 const updateVectorLfos = () => {
-  // no-op for math-based UI LFOs; watcher keeps API stable
+  vectorLfo.xSteps = Math.max(1, toNumber(vectorLfo.xSteps, 1));
+  vectorLfo.ySteps = Math.max(1, toNumber(vectorLfo.ySteps, 1));
+  vectorLfoHoldPhase.x = vectorLfoPhase.x;
+  vectorLfoHoldPhase.y = vectorLfoPhase.y;
+  vectorLfoHold.x = Math.random() * 2 - 1;
+  vectorLfoHold.y = Math.random() * 2 - 1;
 };
 
 const morphPartials = (a = [], b = [], t = 0) => {
@@ -330,18 +407,71 @@ const updateSampleSlot = async (slotIndex) => {
   await buildVoicePool();
 };
 
+const slotLfoSettings = (slot) => {
+  const frameCount = Math.max(slot.wavetable.frames?.length || 0, 1);
+  const enabled = slot.wavetable.lfoEnabled !== false;
+  const amount = Math.max(0, toNumber(slot.wavetable.lfoAmount, 0));
+  const freq = enabled ? computeLfoFrequency(slot.wavetable.lfoRate, slot.wavetable.lfoSync, slot.wavetable.lfoSteps) : 0;
+  const max = enabled && frameCount > 1 ? (frameCount - 1) * amount : 0;
+  return { frameCount, enabled, freq, max, shape: slot.wavetable.lfoShape || 'sine' };
+};
+
+const lfoValueForEntry = (entry) => {
+  if (!entry?.lfo) return 0;
+  if (entry.lfoShape === 'random') {
+    const now = Tone.now();
+    const period = 1 / Math.max(entry.lfo.frequency.value || 0, 0.0001);
+    if (entry.sampleHoldLast + period <= now) {
+      entry.sampleHoldLast = now;
+      entry.sampleHoldValue = Math.random() * entry.lfo.max;
+    }
+    return entry.sampleHoldValue ?? 0;
+  }
+  return entry.lfo.value;
+};
+
+const setLfoRunning = (running) => {
+  voicePool.forEach((voice) => {
+    voice.slots?.forEach((entry) => {
+      if (entry?.type !== 'wavetable' || !entry.lfo) return;
+      const enabled = entry.slot.wavetable.lfoEnabled !== false;
+      if (running && enabled && entry.lfo.state !== 'started') {
+        entry.lfo.start();
+      } else if ((!running || !enabled) && entry.lfo.state === 'started') {
+        entry.lfo.stop();
+      }
+    });
+  });
+};
+
+const setVectorLfoRunning = (running) => {
+  vectorLfoTransportRunning = running;
+  vectorLfoLast = performance.now();
+};
+
 const updateSlotModulation = (slotIndex) => {
   const slot = oscillators[slotIndex];
   if (slot.type !== 'wavetable') return;
   slot.wavetable.lfoRate = toNumber(slot.wavetable.lfoRate, 0);
   slot.wavetable.lfoAmount = toNumber(slot.wavetable.lfoAmount, 0);
+  slot.wavetable.lfoSteps = Math.max(1, toNumber(slot.wavetable.lfoSteps, 1));
   voicePool.forEach((voice) => {
     const entry = voice.slots?.[slotIndex];
     if (!entry || entry.type !== 'wavetable') return;
-    const frameCount = Math.max(slot.wavetable.frames?.length || 0, 1);
-    entry.lfo.frequency.value = slot.wavetable.lfoRate;
+    const { freq, max, shape, enabled } = slotLfoSettings(slot);
+    const toneShape = shape === 'random' ? 'sine' : shape;
+    entry.lfo.sync();
+    entry.lfo.type = toneShape;
+    entry.lfo.frequency.value = freq;
     entry.lfo.min = 0;
-    entry.lfo.max = frameCount > 1 ? (frameCount - 1) * slot.wavetable.lfoAmount : 0;
+    entry.lfo.max = max;
+    entry.lfoShape = shape;
+    entry.sampleHoldLast = Tone.now();
+    if (enabled && entry.lfo.state !== 'started') {
+      entry.lfo.start();
+    } else if (!enabled && entry.lfo.state === 'started') {
+      entry.lfo.stop();
+    }
   });
 };
 
@@ -404,6 +534,9 @@ const laneVoices = Array.from({ length: rows }, () => null);
 let voicePool = [];
 let vectorLfoFrame;
 let vectorLfoLast = 0;
+let vectorLfoHold = { x: Math.random() * 2 - 1, y: Math.random() * 2 - 1 };
+let vectorLfoHoldPhase = { x: 0, y: 0 };
+let vectorLfoTransportRunning = false;
 const vectorLfoPhase = reactive({ x: 0, y: 0 });
 
 const disposePool = () => {
@@ -476,27 +609,45 @@ const buildVoicePool = async () => {
 
       if (!slot.wavetable.frames?.length) return null;
       const frames = slot.wavetable.frames;
-      const frameCount = Math.max(frames.length, 1);
+      const lfoConfig = slotLfoSettings(slot);
+      const toneShape = lfoConfig.shape === 'random' ? 'sine' : lfoConfig.shape;
       const lfo = new Tone.LFO({
-        frequency: toNumber(slot.wavetable.lfoRate, 0.15),
+        type: toneShape,
+        frequency: lfoConfig.freq,
         min: 0,
-        max: frameCount > 1 ? (frameCount - 1) * toNumber(slot.wavetable.lfoAmount, 1) : 0
-      }).start();
+        max: lfoConfig.max
+      });
+      lfo.sync();
+      if (lfoConfig.enabled) {
+        lfo.start();
+      }
       const osc = new Tone.Oscillator({
         type: 'custom',
         partials: frames[0] || [1]
       }).connect(filter);
-      const partialLoop = frameCount > 1
+      const entry = {
+        type: 'wavetable',
+        slot,
+        osc,
+        gain,
+        lfo,
+        lfoShape: lfoConfig.shape,
+        sampleHoldValue: 0,
+        sampleHoldLast: Tone.now(),
+        panner,
+        filter
+      };
+      entry.partialLoop = lfoConfig.frameCount > 1
         ? new Tone.Loop(() => {
-            const pos = lfo.value;
+            const pos = lfoValueForEntry(entry);
             const idx = Math.floor(pos);
-            const nextIdx = Math.min(idx + 1, frameCount - 1);
+            const nextIdx = Math.min(idx + 1, lfoConfig.frameCount - 1);
             const t = Math.min(Math.max(pos - idx, 0), 1);
             osc.partials = morphPartials(frames[idx], frames[nextIdx], t);
           }, '32n').start(0)
         : null;
       osc.start();
-      return { type: 'wavetable', slot, osc, gain, lfo, partialLoop, panner, filter };
+      return entry;
     });
 
     voicePool.push({
@@ -760,12 +911,16 @@ const startSequencer = async () => {
   }
   loop.start(0);
   Tone.Transport.start();
+  setLfoRunning(true);
+  setVectorLfoRunning(true);
   isSequencerRunning.value = true;
 };
 
 const stopSequencer = () => {
   if (loop) loop.stop();
   Tone.Transport.stop();
+  setLfoRunning(false);
+  setVectorLfoRunning(false);
   // hard stop all voices when transport stops
   const now = Tone.now();
   activeVoices.forEach((voices, note) => {
@@ -881,13 +1036,28 @@ watch(bpm, (next) => {
   if (isSequencerRunning.value) {
     Tone.Transport.bpm.rampTo(next, 0.2);
   }
+  oscillators.forEach((_, idx) => updateSlotModulation(idx));
+  updateVectorLfos();
 });
 watch(
   () => [vectorPos.x, vectorPos.y],
   () => updateActiveVoiceGains()
 );
 watch(
-  () => [vectorLfo.xRate, vectorLfo.xAmount, vectorLfo.yRate, vectorLfo.yAmount],
+  () => [
+    vectorLfo.xRate,
+    vectorLfo.xAmount,
+    vectorLfo.xShape,
+    vectorLfo.xSync,
+    vectorLfo.xSteps,
+    vectorLfo.xEnabled,
+    vectorLfo.yRate,
+    vectorLfo.yAmount,
+    vectorLfo.yShape,
+    vectorLfo.ySync,
+    vectorLfo.ySteps,
+    vectorLfo.yEnabled
+  ],
   () => updateVectorLfos()
 );
 watch(filterType, () => {
@@ -969,7 +1139,53 @@ watch(
                         />
                         <v-row dense class="mt-2">
                           <v-col cols="6">
+                            <v-switch
+                              label="LFO on"
+                              density="compact"
+                              inset
+                              color="primary"
+                              hide-details
+                              v-model="slot.wavetable.lfoEnabled"
+                              @update:model-value="() => updateSlotModulation(idx)"
+                            />
+                          </v-col>
+                          <v-col cols="6">
+                            <v-switch
+                              label="Sync to steps"
+                              density="compact"
+                              inset
+                              color="primary"
+                              hide-details
+                              v-model="slot.wavetable.lfoSync"
+                              @update:model-value="() => updateSlotModulation(idx)"
+                            />
+                          </v-col>
+                          <v-col cols="6">
+                            <v-select
+                              label="LFO shape"
+                              :items="lfoShapeOptions"
+                              v-model="slot.wavetable.lfoShape"
+                              variant="outlined"
+                              density="comfortable"
+                              hide-details
+                              @update:model-value="() => updateSlotModulation(idx)"
+                            />
+                          </v-col>
+                          <v-col cols="6">
                             <v-text-field
+                              v-if="slot.wavetable.lfoSync"
+                              label="Steps per cycle"
+                              type="number"
+                              variant="outlined"
+                              density="comfortable"
+                              hide-details
+                              :min="1"
+                              :step="1"
+                              v-model.number="slot.wavetable.lfoSteps"
+                              @update:model-value="() => updateSlotModulation(idx)"
+                            />
+                            <v-text-field
+                              v-else
                               label="LFO rate (Hz)"
                               type="number"
                               variant="outlined"
@@ -981,7 +1197,7 @@ watch(
                               @update:model-value="() => updateSlotModulation(idx)"
                             />
                           </v-col>
-                          <v-col cols="6">
+                          <v-col cols="12">
                             <v-slider
                               label="LFO amount"
                               v-model.number="slot.wavetable.lfoAmount"
@@ -1225,54 +1441,160 @@ watch(
                 </div>
                 <v-row dense>
                   <v-col cols="6">
-                    <v-text-field
-                      label="X rate (Hz)"
-                      type="number"
-                      v-model.number="vectorLfo.xRate"
-                      variant="outlined"
-                      density="comfortable"
-                      hide-details
-                      :step="0.01"
-                      :min="0"
-                    />
+                    <div class="text-subtitle-2 font-weight-medium mb-1">X LFO</div>
+                    <v-row dense>
+                      <v-col cols="6">
+                        <v-switch
+                          label="On"
+                          density="compact"
+                          inset
+                          color="primary"
+                          hide-details
+                          v-model="vectorLfo.xEnabled"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="6">
+                        <v-switch
+                          label="Sync to steps"
+                          density="compact"
+                          inset
+                          color="primary"
+                          hide-details
+                          v-model="vectorLfo.xSync"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="12">
+                        <v-select
+                          label="Shape"
+                          :items="lfoShapeOptions"
+                          v-model="vectorLfo.xShape"
+                          variant="outlined"
+                          density="comfortable"
+                          hide-details
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="12">
+                        <v-text-field
+                          v-if="vectorLfo.xSync"
+                          label="Steps per cycle"
+                          type="number"
+                          v-model.number="vectorLfo.xSteps"
+                          variant="outlined"
+                          density="comfortable"
+                          hide-details
+                          :min="1"
+                          :step="1"
+                          @update:model-value="updateVectorLfos"
+                        />
+                        <v-text-field
+                          v-else
+                          label="Rate (Hz)"
+                          type="number"
+                          v-model.number="vectorLfo.xRate"
+                          variant="outlined"
+                          density="comfortable"
+                          hide-details
+                          :step="0.01"
+                          :min="0"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="12">
+                        <v-slider
+                          label="Amount"
+                          v-model.number="vectorLfo.xAmount"
+                          min="0"
+                          max="1"
+                          step="0.01"
+                          density="comfortable"
+                          hide-details
+                          thumb-label
+                          color="primary"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                    </v-row>
                   </v-col>
                   <v-col cols="6">
-                    <v-slider
-                      label="X amount"
-                      v-model.number="vectorLfo.xAmount"
-                      min="0"
-                      max="1"
-                      step="0.01"
-                      density="comfortable"
-                      hide-details
-                      thumb-label
-                      color="primary"
-                    />
-                  </v-col>
-                  <v-col cols="6">
-                    <v-text-field
-                      label="Y rate (Hz)"
-                      type="number"
-                      v-model.number="vectorLfo.yRate"
-                      variant="outlined"
-                      density="comfortable"
-                      hide-details
-                      :step="0.01"
-                      :min="0"
-                    />
-                  </v-col>
-                  <v-col cols="6">
-                    <v-slider
-                      label="Y amount"
-                      v-model.number="vectorLfo.yAmount"
-                      min="0"
-                      max="1"
-                      step="0.01"
-                      density="comfortable"
-                      hide-details
-                      thumb-label
-                      color="primary"
-                    />
+                    <div class="text-subtitle-2 font-weight-medium mb-1">Y LFO</div>
+                    <v-row dense>
+                      <v-col cols="6">
+                        <v-switch
+                          label="On"
+                          density="compact"
+                          inset
+                          color="primary"
+                          hide-details
+                          v-model="vectorLfo.yEnabled"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="6">
+                        <v-switch
+                          label="Sync to steps"
+                          density="compact"
+                          inset
+                          color="primary"
+                          hide-details
+                          v-model="vectorLfo.ySync"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="12">
+                        <v-select
+                          label="Shape"
+                          :items="lfoShapeOptions"
+                          v-model="vectorLfo.yShape"
+                          variant="outlined"
+                          density="comfortable"
+                          hide-details
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="12">
+                        <v-text-field
+                          v-if="vectorLfo.ySync"
+                          label="Steps per cycle"
+                          type="number"
+                          v-model.number="vectorLfo.ySteps"
+                          variant="outlined"
+                          density="comfortable"
+                          hide-details
+                          :min="1"
+                          :step="1"
+                          @update:model-value="updateVectorLfos"
+                        />
+                        <v-text-field
+                          v-else
+                          label="Rate (Hz)"
+                          type="number"
+                          v-model.number="vectorLfo.yRate"
+                          variant="outlined"
+                          density="comfortable"
+                          hide-details
+                          :step="0.01"
+                          :min="0"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                      <v-col cols="12">
+                        <v-slider
+                          label="Amount"
+                          v-model.number="vectorLfo.yAmount"
+                          min="0"
+                          max="1"
+                          step="0.01"
+                          density="comfortable"
+                          hide-details
+                          thumb-label
+                          color="primary"
+                          @update:model-value="updateVectorLfos"
+                        />
+                      </v-col>
+                    </v-row>
                   </v-col>
                 </v-row>
 

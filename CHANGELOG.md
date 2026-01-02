@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.1] - 2026-01-02
+
+- Added LFO shape selector (sine/triangle/square/saw/S&H) and per-slot on/off plus sync-to-steps for wavetable frame scanning.
+- Vector X/Y LFOs now mirror those controls (shape, on/off, step sync) and follow the Transport start/stop state alongside slot LFOs.
+- Fixed Tone.js errors around invalid LFO types and scheduling, keeping Transport Start/Stop stable.
+- Tweaked Tone context scheduling (lookAhead/updateInterval) to reduce UI-induced crackles.
+
 ## [0.1.0] - 2026-01-02
 
 - Vue 3 + Vite scaffold with Vuetify UI.
